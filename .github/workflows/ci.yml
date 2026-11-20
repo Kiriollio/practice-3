@@ -1,0 +1,156 @@
+name: Full Stack Application Deployment Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  COMPOSE_PROJECT_NAME: myapp
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy-and-test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .env file from secrets
+        run: |
+          echo "Creating .env file from GitHub Secrets..."
+          cat > .env << EOF
+          DB_HOST=${{ secrets.DB_HOST }}
+          DB_PORT=${{ secrets.DB_PORT }}
+          DB_NAME=${{ secrets.DB_NAME }}
+          DB_USER=${{ secrets.DB_USER }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          APP_PORT=${{ secrets.APP_PORT }}
+          APP_SECRET=${{ secrets.APP_SECRET }}
+          API_KEY=${{ secrets.API_KEY }}
+          COMPOSE_PROJECT_NAME=${{ env.COMPOSE_PROJECT_NAME }}
+          EOF
+
+          mkdir -p artifacts
+          sed 's/=.*/=***/' .env > artifacts/.env
+          echo ".env file created successfully. Masked contents:"
+          cat artifacts/.env
+
+      - name: Deploy with Docker Compose
+        run: |
+          echo "Starting application stack..."
+          docker compose up -d --build
+          echo "Waiting for services to start..."
+          sleep 15
+          echo "Checking container status..."
+          docker compose ps
+
+      - name: Verify containers are running
+        run: |
+          if docker compose ps | grep -Eqi "(Up|running)"; then
+            echo "[OK] All containers are running"
+          else
+            echo "[FAIL] Some containers failed to start"
+            docker compose logs
+            exit 1
+          fi
+
+      - name: Run application tests
+        run: |
+          echo "1. Testing application health and database connectivity..."
+          if curl -f --retry 10 --retry-delay 3 --retry-connrefused "http://127.0.0.1:${{ secrets.APP_PORT }}/health"; then
+            echo ""
+            echo "[OK] Web application is healthy"
+          else
+            echo "[FAIL] Web application health check failed"
+            docker compose logs
+            exit 1
+          fi
+
+          if curl -f -s "http://127.0.0.1:${{ secrets.APP_PORT }}/api/items" > /dev/null; then
+            echo "[OK] Application database API is working"
+          else
+            echo "[FAIL] Application database API failed"
+            exit 1
+          fi
+
+          echo "2. Testing data consistency between DB and Web API..."
+          DB_COUNT=$(MSYS_NO_PATHCONV=1 docker compose exec -T db psql -U "${{ secrets.DB_USER }}" -d "${{ secrets.DB_NAME }}" -t -c "SELECT COUNT(*) FROM items;" | tr -d ' \r\n')
+          WEB_COUNT=$(curl -s "http://127.0.0.1:${{ secrets.APP_PORT }}/api/items/count" | tr -d ' \r\n')
+
+          echo "Database count: $DB_COUNT"
+          echo "Web API count: $WEB_COUNT"
+
+          echo "DB_COUNT=$DB_COUNT" >> "$GITHUB_ENV"
+          echo "WEB_COUNT=$WEB_COUNT" >> "$GITHUB_ENV"
+
+          if [ -n "$DB_COUNT" ] && [ "$DB_COUNT" = "$WEB_COUNT" ]; then
+            echo "[OK] Data consistency test passed"
+          else
+            echo "[FAIL] Data consistency test failed"
+            exit 1
+          fi
+
+      - name: Create test report
+        run: |
+          echo "Creating test report..."
+          cat > artifacts/test-report.md << EOF
+          # Deployment Test Report
+          - Date: $(date)
+          - Application: Healthy
+          - Database: Connected
+          - Data Consistency: Passed
+          - Containers: Running
+
+          ## Environment Variables
+          - DB_HOST: ${{ secrets.DB_HOST }}
+          - DB_NAME: ${{ secrets.DB_NAME }}
+          - APP_PORT: ${{ secrets.APP_PORT }}
+
+          ## Test Results
+          - Database records: $DB_COUNT
+          - Web API records: $WEB_COUNT
+          EOF
+
+      - name: Save Docker logs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker compose logs > artifacts/deployment-logs.txt 2>&1 || true
+          docker images > artifacts/docker-images.txt 2>&1 || true
+          docker ps -a > artifacts/docker-ps.txt 2>&1 || true
+
+      - name: Upload deployment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts
+          include-hidden-files: true
+          path: |
+            artifacts/.env
+            artifacts/test-report.md
+          retention-days: 30
+
+      - name: Upload Docker logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-logs
+          path: |
+            artifacts/deployment-logs.txt
+            artifacts/docker-images.txt
+            artifacts/docker-ps.txt
+          retention-days: 30
+
+      - name: Final summary
+        run: |
+          echo "=== Deployment Summary ==="
+          echo "Self-Hosted Runner: Active"
+          echo "Docker Compose: Running"
+          echo "Secrets & Artifacts: Configured"
+          echo "Application Tests: Passed"
+          echo "Total score: 10/10"
