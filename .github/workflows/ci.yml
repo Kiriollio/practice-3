@@ -10,7 +10,7 @@ env:
 
 defaults:
   run:
-    shell: bash
+    shell: powershell
 
 jobs:
   deploy-and-test:
@@ -22,107 +22,141 @@ jobs:
 
       - name: Create .env file from secrets
         run: |
-          echo "Creating .env file from GitHub Secrets..."
-          cat > .env << EOF
-          DB_HOST=${{ secrets.DB_HOST }}
-          DB_PORT=${{ secrets.DB_PORT }}
-          DB_NAME=${{ secrets.DB_NAME }}
-          DB_USER=${{ secrets.DB_USER }}
-          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-          APP_PORT=${{ secrets.APP_PORT }}
-          APP_SECRET=${{ secrets.APP_SECRET }}
-          API_KEY=${{ secrets.API_KEY }}
-          COMPOSE_PROJECT_NAME=${{ env.COMPOSE_PROJECT_NAME }}
-          EOF
+          Write-Host "Creating .env file from GitHub Secrets..."
+          $lines = @(
+            "DB_HOST=${{ secrets.DB_HOST }}"
+            "DB_PORT=${{ secrets.DB_PORT }}"
+            "DB_NAME=${{ secrets.DB_NAME }}"
+            "DB_USER=${{ secrets.DB_USER }}"
+            "DB_PASSWORD=${{ secrets.DB_PASSWORD }}"
+            "APP_PORT=${{ secrets.APP_PORT }}"
+            "APP_SECRET=${{ secrets.APP_SECRET }}"
+            "API_KEY=${{ secrets.API_KEY }}"
+            "COMPOSE_PROJECT_NAME=${{ env.COMPOSE_PROJECT_NAME }}"
+          )
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          $root = (Get-Location).Path
+          [System.IO.File]::WriteAllText((Join-Path $root ".env"), (($lines -join "`n") + "`n"), $utf8NoBom)
 
-          mkdir -p artifacts
-          sed 's/=.*/=***/' .env > artifacts/.env
-          echo ".env file created successfully. Masked contents:"
-          cat artifacts/.env
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+          $masked = $lines | ForEach-Object { $_ -replace '=.*', '=***' }
+          [System.IO.File]::WriteAllText((Join-Path $root "artifacts\.env"), (($masked -join "`n") + "`n"), $utf8NoBom)
+          Write-Host ".env file created successfully. Masked contents:"
+          Get-Content "artifacts\.env"
 
       - name: Deploy with Docker Compose
         run: |
-          echo "Starting application stack..."
+          $ErrorActionPreference = "Continue"
+          Write-Host "Starting application stack..."
           docker compose up -d --build
-          echo "Waiting for services to start..."
-          sleep 15
-          echo "Checking container status..."
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Waiting for services to start..."
+          Start-Sleep -Seconds 15
+          Write-Host "Checking container status..."
           docker compose ps
 
       - name: Verify containers are running
         run: |
-          if docker compose ps | grep -Eqi "(Up|running)"; then
-            echo "[OK] All containers are running"
-          else
-            echo "[FAIL] Some containers failed to start"
+          $ErrorActionPreference = "Continue"
+          $psOut = docker compose ps | Out-String
+          if ($psOut -match "(?i)(Up|running)") {
+            Write-Host "[OK] All containers are running"
+          } else {
+            Write-Host "[FAIL] Some containers failed to start"
             docker compose logs
             exit 1
-          fi
+          }
 
       - name: Run application tests
         run: |
-          echo "1. Testing application health and database connectivity..."
-          if curl -f --retry 10 --retry-delay 3 --retry-connrefused "http://127.0.0.1:${{ secrets.APP_PORT }}/health"; then
-            echo ""
-            echo "[OK] Web application is healthy"
-          else
-            echo "[FAIL] Web application health check failed"
+          $ErrorActionPreference = "Continue"
+          Write-Host "1. Testing application health and database connectivity..."
+          $healthy = $false
+          for ($i = 1; $i -le 15; $i++) {
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:${{ secrets.APP_PORT }}/health" -UseBasicParsing -TimeoutSec 5
+              if ($resp.StatusCode -eq 200) {
+                Write-Host $resp.Content
+                Write-Host "[OK] Web application is healthy"
+                $healthy = $true
+                break
+              }
+            } catch {
+              Write-Host "Attempt $i/15 failed, retrying in 3s..."
+              Start-Sleep -Seconds 3
+            }
+          }
+          if (-not $healthy) {
+            Write-Host "[FAIL] Web application health check failed"
             docker compose logs
             exit 1
-          fi
+          }
 
-          if curl -f -s "http://127.0.0.1:${{ secrets.APP_PORT }}/api/items" > /dev/null; then
-            echo "[OK] Application database API is working"
-          else
-            echo "[FAIL] Application database API failed"
+          try {
+            $itemsResp = Invoke-WebRequest -Uri "http://127.0.0.1:${{ secrets.APP_PORT }}/api/items" -UseBasicParsing -TimeoutSec 5
+            if ($itemsResp.StatusCode -eq 200) {
+              Write-Host "[OK] Application database API is working"
+            } else {
+              throw "Unexpected status: $($itemsResp.StatusCode)"
+            }
+          } catch {
+            Write-Host "[FAIL] Application database API failed: $_"
+            docker compose logs
             exit 1
-          fi
+          }
 
-          echo "2. Testing data consistency between DB and Web API..."
-          DB_COUNT=$(MSYS_NO_PATHCONV=1 docker compose exec -T db psql -U "${{ secrets.DB_USER }}" -d "${{ secrets.DB_NAME }}" -t -c "SELECT COUNT(*) FROM items;" | tr -d ' \r\n')
-          WEB_COUNT=$(curl -s "http://127.0.0.1:${{ secrets.APP_PORT }}/api/items/count" | tr -d ' \r\n')
+          Write-Host "2. Testing data consistency between DB and Web API..."
+          $dbCount = ((docker compose exec -T db psql -U "${{ secrets.DB_USER }}" -d "${{ secrets.DB_NAME }}" -t -c "SELECT COUNT(*) FROM items;") | Out-String) -replace '\s', ''
+          $webCount = (Invoke-WebRequest -Uri "http://127.0.0.1:${{ secrets.APP_PORT }}/api/items/count" -UseBasicParsing -TimeoutSec 5).Content -replace '\s', ''
 
-          echo "Database count: $DB_COUNT"
-          echo "Web API count: $WEB_COUNT"
+          Write-Host "Database count: $dbCount"
+          Write-Host "Web API count: $webCount"
 
-          echo "DB_COUNT=$DB_COUNT" >> "$GITHUB_ENV"
-          echo "WEB_COUNT=$WEB_COUNT" >> "$GITHUB_ENV"
+          "DB_COUNT=$dbCount" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "WEB_COUNT=$webCount" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
 
-          if [ -n "$DB_COUNT" ] && [ "$DB_COUNT" = "$WEB_COUNT" ]; then
-            echo "[OK] Data consistency test passed"
-          else
-            echo "[FAIL] Data consistency test failed"
+          if ($dbCount -and ($dbCount -eq $webCount)) {
+            Write-Host "[OK] Data consistency test passed"
+          } else {
+            Write-Host "[FAIL] Data consistency test failed"
             exit 1
-          fi
+          }
 
       - name: Create test report
         run: |
-          echo "Creating test report..."
-          cat > artifacts/test-report.md << EOF
-          # Deployment Test Report
-          - Date: $(date)
-          - Application: Healthy
-          - Database: Connected
-          - Data Consistency: Passed
-          - Containers: Running
-
-          ## Environment Variables
-          - DB_HOST: ${{ secrets.DB_HOST }}
-          - DB_NAME: ${{ secrets.DB_NAME }}
-          - APP_PORT: ${{ secrets.APP_PORT }}
-
-          ## Test Results
-          - Database records: $DB_COUNT
-          - Web API records: $WEB_COUNT
-          EOF
+          Write-Host "Creating test report..."
+          $dateStr = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+          $reportLines = @(
+            "# Deployment Test Report"
+            "- Date: $dateStr"
+            "- Application: Healthy"
+            "- Database: Connected"
+            "- Data Consistency: Passed"
+            "- Containers: Running"
+            ""
+            "## Environment Variables"
+            "- DB_HOST: ${{ secrets.DB_HOST }}"
+            "- DB_NAME: ${{ secrets.DB_NAME }}"
+            "- APP_PORT: ${{ secrets.APP_PORT }}"
+            ""
+            "## Test Results"
+            "- Database records: $env:DB_COUNT"
+            "- Web API records: $env:WEB_COUNT"
+          )
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          $root = (Get-Location).Path
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+          [System.IO.File]::WriteAllText((Join-Path $root "artifacts\test-report.md"), (($reportLines -join "`n") + "`n"), $utf8NoBom)
 
       - name: Save Docker logs
         if: always()
         run: |
-          mkdir -p artifacts
-          docker compose logs > artifacts/deployment-logs.txt 2>&1 || true
-          docker images > artifacts/docker-images.txt 2>&1 || true
-          docker ps -a > artifacts/docker-ps.txt 2>&1 || true
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+          cmd /c "docker compose logs --no-color > artifacts\deployment-logs.txt 2>&1"
+          cmd /c "docker images > artifacts\docker-images.txt 2>&1"
+          cmd /c "docker ps -a > artifacts\docker-ps.txt 2>&1"
+          exit 0
 
       - name: Upload deployment artifacts
         if: always()
@@ -148,9 +182,9 @@ jobs:
 
       - name: Final summary
         run: |
-          echo "=== Deployment Summary ==="
-          echo "Self-Hosted Runner: Active"
-          echo "Docker Compose: Running"
-          echo "Secrets & Artifacts: Configured"
-          echo "Application Tests: Passed"
-          echo "Total score: 10/10"
+          Write-Host "=== Deployment Summary ==="
+          Write-Host "Self-Hosted Runner: Active"
+          Write-Host "Docker Compose: Running"
+          Write-Host "Secrets & Artifacts: Configured"
+          Write-Host "Application Tests: Passed"
+          Write-Host "Total score: 10/10"
