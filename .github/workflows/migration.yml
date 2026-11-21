@@ -36,37 +36,37 @@ jobs:
           }
 
       - name: Backup MySQL database
-    if: steps.check_flag.outputs.migrated != 'true'
-    env:
-      DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
-    run: |
-      $running = docker ps --format "{{.Names}}"
-      if ($running -notcontains "mattermost-mysql") {
-        docker start mattermost-mysql
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      }
-      $mysqlReady = $false
-      for ($i = 1; $i -le 30; $i++) {
-        docker exec -e MYSQL_PWD="$env:DB_MYSQL_ROOT_PASSWORD" mattermost-mysql mysqladmin -h 127.0.0.1 -u root ping --silent 2>$null
-        if ($LASTEXITCODE -eq 0) {
-          Write-Host "MySQL is ready!"
-          $mysqlReady = $true
-          break
-        }
-        Write-Host "Waiting for MySQL... ($i/30)"
-        Start-Sleep -Seconds 2
-      }
-      if (-not $mysqlReady) {
-        Write-Error "MySQL did not become ready in time!"
-        docker logs mattermost-mysql --tail 30
-        exit 1
-      }
-      New-Item -ItemType Directory -Force -Path backups | Out-Null
-      docker exec -e MYSQL_PWD="$env:DB_MYSQL_ROOT_PASSWORD" mattermost-mysql sh -c "mysqldump -h 127.0.0.1 -u root --single-transaction --routines --triggers mattermost > /tmp/mattermost_mysql_backup.sql"
-      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      docker cp mattermost-mysql:/tmp/mattermost_mysql_backup.sql backups/mattermost_mysql_backup.sql
-      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      Get-Item backups/mattermost_mysql_backup.sql | Select-Object Name, Length
+        if: steps.check_flag.outputs.migrated != 'true'
+        env:
+          DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+        run: |
+          $running = docker ps --format "{{.Names}}"
+          if ($running -notcontains "mattermost-mysql") {
+            docker start mattermost-mysql
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $mysqlReady = $false
+          for ($i = 1; $i -le 30; $i++) {
+            docker exec -e MYSQL_PWD="$env:DB_MYSQL_ROOT_PASSWORD" mattermost-mysql mysqladmin -h 127.0.0.1 -u root ping --silent 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "MySQL is ready!"
+              $mysqlReady = $true
+              break
+            }
+            Write-Host "Waiting for MySQL... ($i/30)"
+            Start-Sleep -Seconds 2
+          }
+          if (-not $mysqlReady) {
+            Write-Error "MySQL did not become ready in time!"
+            docker logs mattermost-mysql --tail 30
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path backups | Out-Null
+          docker exec -e MYSQL_PWD="$env:DB_MYSQL_ROOT_PASSWORD" mattermost-mysql sh -c "mysqldump -h 127.0.0.1 -u root --single-transaction --routines --triggers mattermost > /tmp/mattermost_mysql_backup.sql"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker cp mattermost-mysql:/tmp/mattermost_mysql_backup.sql backups/mattermost_mysql_backup.sql
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item backups/mattermost_mysql_backup.sql | Select-Object Name, Length
 
       - name: Stop and remove legacy Mattermost container
         if: steps.check_flag.outputs.migrated != 'true'
