@@ -80,8 +80,7 @@ jobs:
           docker run --rm `
             --network mattermost_network `
             --entrypoint /mattermost/bin/mattermost `
-            -e MM_SQLSETTINGS_DRIVERNAME=postgres `
-            -e "MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:$($env:DB_POSTGRES_PASSWORD)@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10" `
+            -e "MM_CONFIG=postgres://mmuser:$($env:DB_POSTGRES_PASSWORD)@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10" `
             mattermost/mattermost-team-edition:9.5 `
             db init
 
