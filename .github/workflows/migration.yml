@@ -47,16 +47,21 @@ jobs:
           exit 0
 
       - name: Start PostgreSQL and prepare clean schema
+        env:
+          DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
           docker compose -f docker-compose.prod.yml up -d mattermost-postgres
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $ready = $false
           for ($i = 1; $i -le 30; $i++) {
-            docker exec mattermost-postgres pg_isready -U mmuser -d mattermost
+            docker exec mattermost-postgres pg_isready -h 127.0.0.1 -U mmuser -d mattermost
             if ($LASTEXITCODE -eq 0) {
-              Write-Host "PostgreSQL is ready!"
-              $ready = $true
-              break
+              docker exec -e PGPASSWORD="$env:DB_POSTGRES_PASSWORD" mattermost-postgres psql -h 127.0.0.1 -U mmuser -d mattermost -c "SELECT 1;"
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "PostgreSQL is ready!"
+                $ready = $true
+                break
+              }
             }
             Write-Host "Waiting for PostgreSQL... ($i/30)"
             Start-Sleep -Seconds 2
@@ -65,7 +70,7 @@ jobs:
             Write-Error "PostgreSQL did not become ready in time!"
             exit 1
           }
-          docker exec mattermost-postgres psql -U mmuser -d mattermost -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+          docker exec -e PGPASSWORD="$env:DB_POSTGRES_PASSWORD" mattermost-postgres psql -h 127.0.0.1 -U mmuser -d mattermost -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Initialize Mattermost 9.5 schema in PostgreSQL
@@ -125,8 +130,10 @@ jobs:
           if ($exitCode -ne 0) { exit $exitCode }
 
       - name: Verify migrated row counts in PostgreSQL
+        env:
+          DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
-          docker exec mattermost-postgres psql -U mmuser -d mattermost -c "SELECT 'users' AS table_name, COUNT(*) FROM users UNION ALL SELECT 'teams', COUNT(*) FROM teams UNION ALL SELECT 'channels', COUNT(*) FROM channels UNION ALL SELECT 'posts', COUNT(*) FROM posts UNION ALL SELECT 'fileinfo', COUNT(*) FROM fileinfo;"
+          docker exec -e PGPASSWORD="$env:DB_POSTGRES_PASSWORD" mattermost-postgres psql -h 127.0.0.1 -U mmuser -d mattermost -c "SELECT 'users' AS table_name, COUNT(*) FROM users UNION ALL SELECT 'teams', COUNT(*) FROM teams UNION ALL SELECT 'channels', COUNT(*) FROM channels UNION ALL SELECT 'posts', COUNT(*) FROM posts UNION ALL SELECT 'fileinfo', COUNT(*) FROM fileinfo;"
 
       - name: Deploy new Mattermost on PostgreSQL
         run: |
