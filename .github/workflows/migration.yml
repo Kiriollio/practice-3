@@ -23,7 +23,20 @@ jobs:
         run: |
           [System.IO.File]::WriteAllText("$PWD\.env", "DB_POSTGRES_PASSWORD=$($env:DB_POSTGRES_PASSWORD)`n")
 
+      - name: Check migration flag
+        id: check_flag
+        run: |
+          $flagPath = "$env:USERPROFILE\.mattermost_migrated"
+          if (Test-Path $flagPath) {
+            Write-Host "Migration flag found at $flagPath. Skipping migration steps."
+            "migrated=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host "Migration flag not found. Full migration will run."
+            "migrated=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
       - name: Backup MySQL database
+        if: steps.check_flag.outputs.migrated != 'true'
         env:
           DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
         run: |
@@ -40,6 +53,7 @@ jobs:
           Get-Item backups/mattermost_mysql_backup.sql | Select-Object Name, Length
 
       - name: Stop and remove legacy Mattermost container
+        if: steps.check_flag.outputs.migrated != 'true'
         run: |
           $ErrorActionPreference = "Continue"
           docker stop mattermost 2>$null
@@ -47,6 +61,7 @@ jobs:
           exit 0
 
       - name: Start PostgreSQL and prepare clean schema
+        if: steps.check_flag.outputs.migrated != 'true'
         env:
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
@@ -74,6 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Initialize Mattermost 9.5 schema in PostgreSQL
+        if: steps.check_flag.outputs.migrated != 'true'
         env:
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
@@ -85,6 +101,7 @@ jobs:
             db init
 
       - name: Migrate data from MySQL to PostgreSQL via pgloader
+        if: steps.check_flag.outputs.migrated != 'true'
         env:
           DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
@@ -129,6 +146,7 @@ jobs:
           if ($exitCode -ne 0) { exit $exitCode }
 
       - name: Verify migrated row counts in PostgreSQL
+        if: steps.check_flag.outputs.migrated != 'true'
         env:
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
@@ -136,7 +154,7 @@ jobs:
 
       - name: Deploy new Mattermost on PostgreSQL
         run: |
-          docker compose -f docker-compose.prod.yml up -d
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
       - name: Healthcheck Mattermost API
         run: |
@@ -156,6 +174,10 @@ jobs:
           docker logs mattermost --tail 50
           exit 1
 
-      - name: Stop legacy MySQL container
+      - name: Remove legacy MySQL container and set migration flag
+        if: steps.check_flag.outputs.migrated != 'true'
         run: |
-          docker stop mattermost-mysql
+          $ErrorActionPreference = "Continue"
+          docker rm -f mattermost-mysql 2>$null
+          New-Item -ItemType File -Force -Path "$env:USERPROFILE\.mattermost_migrated" | Out-Null
+          Write-Host "Legacy MySQL removed and migration flag created."
