@@ -8,10 +8,7 @@ on:
 
 defaults:
   run:
-    shell: bash
-
-env:
-  MSYS_NO_PATHCONV: "1"
+    shell: powershell
 
 jobs:
   migrate:
@@ -24,50 +21,63 @@ jobs:
         env:
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
-          cat <<EOF > .env
-          DB_POSTGRES_PASSWORD=${DB_POSTGRES_PASSWORD}
-          EOF
+          [System.IO.File]::WriteAllText("$PWD\.env", "DB_POSTGRES_PASSWORD=$($env:DB_POSTGRES_PASSWORD)`n")
 
       - name: Backup MySQL database
         env:
           DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
         run: |
-          if ! docker ps --format '{{.Names}}' | grep -q '^mattermost-mysql$'; then
+          $running = docker ps --format "{{.Names}}"
+          if ($running -notcontains "mattermost-mysql") {
             docker start mattermost-mysql
-            sleep 10
-          fi
-          mkdir -p backups
-          docker exec mattermost-mysql mysqldump -u root -p"${DB_MYSQL_ROOT_PASSWORD}" --single-transaction --routines --triggers mattermost > backups/mattermost_mysql_backup.sql
-          ls -lh backups/mattermost_mysql_backup.sql
+            Start-Sleep -Seconds 10
+          }
+          New-Item -ItemType Directory -Force -Path backups | Out-Null
+          docker exec -e MYSQL_PWD="$env:DB_MYSQL_ROOT_PASSWORD" mattermost-mysql sh -c "mysqldump -u root --single-transaction --routines --triggers mattermost > /tmp/mattermost_mysql_backup.sql"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker cp mattermost-mysql:/tmp/mattermost_mysql_backup.sql backups/mattermost_mysql_backup.sql
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item backups/mattermost_mysql_backup.sql | Select-Object Name, Length
 
       - name: Stop and remove legacy Mattermost container
         run: |
-          docker stop mattermost || true
-          docker rm mattermost || true
+          $ErrorActionPreference = "Continue"
+          docker stop mattermost 2>$null
+          docker rm mattermost 2>$null
+          exit 0
 
       - name: Start PostgreSQL and prepare clean schema
         run: |
           docker compose -f docker-compose.prod.yml up -d mattermost-postgres
-          for i in $(seq 1 30); do
-            if docker exec mattermost-postgres pg_isready -U mmuser -d mattermost; then
-              echo "PostgreSQL is ready!"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ready = $false
+          for ($i = 1; $i -le 30; $i++) {
+            docker exec mattermost-postgres pg_isready -U mmuser -d mattermost
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "PostgreSQL is ready!"
+              $ready = $true
               break
-            fi
-            echo "Waiting for PostgreSQL... ($i/30)"
-            sleep 2
-          done
+            }
+            Write-Host "Waiting for PostgreSQL... ($i/30)"
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ready) {
+            Write-Error "PostgreSQL did not become ready in time!"
+            exit 1
+          }
           docker exec mattermost-postgres psql -U mmuser -d mattermost -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Initialize Mattermost 9.5 schema in PostgreSQL
         env:
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
-          docker run --rm \
-            --network mattermost_network \
-            --entrypoint /mattermost/bin/mattermost \
-            -e MM_SQLSETTINGS_DRIVERNAME=postgres \
-            -e MM_SQLSETTINGS_DATASOURCE="postgres://mmuser:${DB_POSTGRES_PASSWORD}@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10" \
-            mattermost/mattermost-team-edition:9.5 \
+          docker run --rm `
+            --network mattermost_network `
+            --entrypoint /mattermost/bin/mattermost `
+            -e MM_SQLSETTINGS_DRIVERNAME=postgres `
+            -e "MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:$($env:DB_POSTGRES_PASSWORD)@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10" `
+            mattermost/mattermost-team-edition:9.5 `
             db init
 
       - name: Migrate data from MySQL to PostgreSQL via pgloader
@@ -75,10 +85,10 @@ jobs:
           DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
           DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
         run: |
-          cat <<EOF > migration.load
+          $loadContent = @"
           LOAD DATABASE
-               FROM mysql://root:${DB_MYSQL_ROOT_PASSWORD}@mattermost-mysql:3306/mattermost
-               INTO postgresql://mmuser:${DB_POSTGRES_PASSWORD}@mattermost-postgres:5432/mattermost
+               FROM mysql://root:$($env:DB_MYSQL_ROOT_PASSWORD)@mattermost-mysql:3306/mattermost
+               INTO postgresql://mmuser:$($env:DB_POSTGRES_PASSWORD)@mattermost-postgres:5432/mattermost
 
           WITH include no drop,
                truncate,
@@ -101,25 +111,22 @@ jobs:
 
           ALTER SCHEMA 'mattermost' RENAME TO 'public'
           ;
-          EOF
+          "@
+          $loadContent = $loadContent -replace "`r`n", "`n"
+          [System.IO.File]::WriteAllText("$PWD\migration.load", $loadContent)
 
-          WORK_DIR="$(pwd -W 2>/dev/null || pwd)"
-          docker run --rm \
-            --network mattermost_network \
-            -v "${WORK_DIR}/migration.load:/migration.load:ro" \
-            dimitri/pgloader:latest \
+          docker run --rm `
+            --network mattermost_network `
+            -v "${PWD}\migration.load:/migration.load:ro" `
+            dimitri/pgloader:latest `
             pgloader /migration.load
-          rm -f migration.load
+          $exitCode = $LASTEXITCODE
+          Remove-Item -Force migration.load -ErrorAction SilentlyContinue
+          if ($exitCode -ne 0) { exit $exitCode }
 
       - name: Verify migrated row counts in PostgreSQL
         run: |
-          docker exec mattermost-postgres psql -U mmuser -d mattermost -c "
-            SELECT 'users' AS table_name, COUNT(*) FROM users
-            UNION ALL SELECT 'teams', COUNT(*) FROM teams
-            UNION ALL SELECT 'channels', COUNT(*) FROM channels
-            UNION ALL SELECT 'posts', COUNT(*) FROM posts
-            UNION ALL SELECT 'fileinfo', COUNT(*) FROM fileinfo;
-          "
+          docker exec mattermost-postgres psql -U mmuser -d mattermost -c "SELECT 'users' AS table_name, COUNT(*) FROM users UNION ALL SELECT 'teams', COUNT(*) FROM teams UNION ALL SELECT 'channels', COUNT(*) FROM channels UNION ALL SELECT 'posts', COUNT(*) FROM posts UNION ALL SELECT 'fileinfo', COUNT(*) FROM fileinfo;"
 
       - name: Deploy new Mattermost on PostgreSQL
         run: |
@@ -127,15 +134,19 @@ jobs:
 
       - name: Healthcheck Mattermost API
         run: |
-          for i in $(seq 1 36); do
-            if curl -sf http://localhost:8065/api/v4/system/ping | grep -q '"status":"OK"'; then
-              echo "Mattermost on PostgreSQL is UP and Healthy!"
-              exit 0
-            fi
-            echo "Waiting for Mattermost... ($i/36)"
-            sleep 5
-          done
-          echo "Mattermost did not become ready in time!"
+          for ($i = 1; $i -le 36; $i++) {
+            try {
+              $res = Invoke-RestMethod -Uri "http://localhost:8065/api/v4/system/ping" -TimeoutSec 5
+              if ($res.status -eq "OK") {
+                Write-Host "Mattermost on PostgreSQL is UP and Healthy!"
+                exit 0
+              }
+            } catch {
+              Write-Host "Waiting for Mattermost... ($i/36)"
+            }
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "Mattermost did not become ready in time!"
           docker logs mattermost --tail 50
           exit 1
 
